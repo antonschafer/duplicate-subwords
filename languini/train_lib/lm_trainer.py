@@ -49,7 +49,7 @@ DEFAULT_CONFIG = {
 }
 
 
-def evaluation(config, model, state, data_source, max_steps, last_n=-1, print_progress=False):
+def evaluation(config, model, state, data_source, max_steps, vocab_mapping, last_n=-1, print_progress=False, track_full_data=False):
     """
     Evaluates the model on a datasource without gradient updates or extra logs besides loss.
     
@@ -59,8 +59,10 @@ def evaluation(config, model, state, data_source, max_steps, last_n=-1, print_pr
         state: the latest state of the model if it has one (or None to initialise a new one).
         data_source: the source for the input and target batches.
         max_step (int): number of batches do process for evaluation.
+        vocab_mapping (VocabMapping): mapping to use for deduplicating labels and logits
         last_n (int): evaluate loss on the last_n targets. If last_n is -1 it will evaluate on all targets.
         print_progress (bool): simple terminal log for eval.py to display progress.
+        track_full_data (bool): whether to return the individual surprisal values during eval (along with the token ids)
     """
     c = config
     local_bsz = config.eval_batch_size // c.n_workers
@@ -78,6 +80,13 @@ def evaluation(config, model, state, data_source, max_steps, last_n=-1, print_pr
     total_top_k_counts = {}
     total_token_count = 0
 
+    if track_full_data:
+        assert dist.get_world_size() == 1, "save_full_data is not supported in distributed mode"
+        EST_MAX_SAMPLES = 100_000 # estimate for maximum number of sequences in the evaluation set, breaks if exceeded
+        x_dataset = torch.full((EST_MAX_SAMPLES, c.seq_len), fill_value=float("nan"), device=c.device, dtype=torch.float32)
+        y_dataset = torch.full((EST_MAX_SAMPLES, c.seq_len), fill_value=float("nan"), device=c.device, dtype=torch.float32)
+        losses_dataset = torch.full((EST_MAX_SAMPLES, c.seq_len), fill_value=float("nan"), device=c.device, dtype=torch.float32)
+
     with torch.no_grad():
         with torch.cuda.amp.autocast(enabled=c.device.type == "cuda"):
             # distribute the given state over the batch-size
@@ -94,7 +103,7 @@ def evaluation(config, model, state, data_source, max_steps, last_n=-1, print_pr
                 eval_batches = tqdm(eval_batches, total=None if max_steps == -1 else max_steps)
 
             # iterate over batches
-            for batch_count, (batch_x, batch_y, is_padded) in enumerate(eval_batches, start=1):
+            for batch_count, (batch_x, batch_y, is_padded, x_is_noncanonical) in enumerate(eval_batches, start=1):
                 if print_progress and batch_count % 1_000 == 0:
                     parallel_utils.mprint(f"{batch_count:d}")
                 
@@ -103,24 +112,37 @@ def evaluation(config, model, state, data_source, max_steps, last_n=-1, print_pr
 
                 # Remove the microbatch dimension
                 batch_x, batch_y = batch_x.squeeze(0), batch_y.squeeze(0)
+                x_is_noncanonical = x_is_noncanonical[0]
                 bsz, seqlen = batch_x.shape
+
+                if track_full_data:
+                    # track data
+                    idx_ds_start, idx_ds_end = bsz * (batch_count - 1), bsz * batch_count
+                    assert idx_ds_end <= EST_MAX_SAMPLES, "exceeded maximum number of samples"
+                    x_dataset[idx_ds_start: idx_ds_end] = batch_x
+                    y_dataset[idx_ds_start: idx_ds_end] = batch_y
+
                 
                 # run the forward pass
-                logits, state = model(batch_x, state, log=None)
+                logits, state = model(batch_x, state, x_is_noncanonical=x_is_noncanonical, log=None)
                 check(logits, (bsz, seqlen, c.vocab_size))
+
+                # deduplicate
+                del batch_x # avoid accidental use
+                batch_y = vocab_mapping.deduplicate_labels(batch_y)
+                logits = vocab_mapping.deduplicate_logits(logits)
+                check(logits, (bsz, seqlen, vocab_mapping.dedup_vocab_size))
 
                 # If last_n is positive we only care about the last_n losses and targets.
                 if last_n == -1:
                     last_n = seqlen
-                batch_x = batch_x[:, -last_n:]
-                check(batch_x, (bsz, last_n))
                 logits = logits[:, -last_n:, :]
-                check(logits, (bsz, last_n, c.vocab_size))
+                check(logits, (bsz, last_n, vocab_mapping.dedup_vocab_size))
                 batch_y = batch_y[:, -last_n:]
                 check(batch_y, (bsz, last_n))
                 
                 # compute loss
-                logits = logits.reshape(bsz * last_n, c.vocab_size)
+                logits = logits.reshape(bsz * last_n, vocab_mapping.dedup_vocab_size)
                 batch_y = batch_y.reshape(bsz * last_n)
                 all_losses = F.cross_entropy(input=logits, target=batch_y, reduction='none')
                 check(all_losses, (bsz * last_n,))
@@ -129,6 +151,9 @@ def evaluation(config, model, state, data_source, max_steps, last_n=-1, print_pr
                 is_padding = batch_y.reshape(-1) == 0 # (bsz * last_n,)
                 all_losses = all_losses.masked_fill(is_padding, 0.0)
                 token_count = torch.sum(~is_padding)
+
+                if track_full_data:
+                    losses_dataset[idx_ds_start: idx_ds_end, -last_n:] = all_losses
 
                 # compute accuracy for top-1 and top-10
                 topk_counts = train_utils.total_correct(logits, batch_y, is_padding=is_padding, topk=(1, 10))
@@ -145,11 +170,20 @@ def evaluation(config, model, state, data_source, max_steps, last_n=-1, print_pr
         parallel_utils.mprint(f'total number of batches processed: {batch_count}')
         dist.all_reduce(total_loss, dist.ReduceOp.SUM)
         dist.all_reduce(total_token_count, dist.ReduceOp.SUM)
+    
+    if track_full_data:
+        full_data = {
+            "x": x_dataset[:idx_ds_end],
+            "y": y_dataset[:idx_ds_end],
+            "surprisals": losses_dataset[:idx_ds_end],
+        }
+    else:
+        full_data = None
 
-    return total_loss.item(), total_top_k_counts, total_token_count.item(), state
+    return total_loss.item(), total_top_k_counts, total_token_count.item(), state, full_data
 
 
-def log_eval_stats(eval_data_source, eval_steps, last_n, sp, logger, device):
+def log_eval_stats(eval_data_source, eval_steps, last_n, sp, logger, device, vocab_mapping):
     """Counts the number of eval batches and the length in string bytes. Saves these values for later."""
     eval_data_source.reset()
     eval_batches = eval_data_source if eval_steps == -1 else itertools.islice(eval_data_source, eval_steps)
@@ -162,12 +196,15 @@ def log_eval_stats(eval_data_source, eval_steps, last_n, sp, logger, device):
     # use tensors to count in case it is distributed across accelerators
     token_count = torch.zeros(1, device=device)
     str_length = torch.zeros(1, device=device)
-    for batch_count, (batch_x, batch_y, is_padded) in enumerate(eval_batches, start=1):
+    for batch_count, (batch_x, batch_y, is_padded, _) in enumerate(eval_batches, start=1):
         check(batch_x, (micro_batches, local_micro_bsz, seqlen))
         check(batch_y, (micro_batches, local_micro_bsz, seqlen))
 
-        batch_x = batch_x[:, :, -last_n:]
         batch_y = batch_y[:, :, -last_n:]
+
+        # deduplicate
+        del batch_x # avoid accidental use
+        batch_y = vocab_mapping.deduplicate_labels(batch_y)
 
         # decode targets and measure length
         batch_y = torch.reshape(batch_y, (batch_y.shape[0] * batch_y.shape[1], -1))
@@ -204,7 +241,7 @@ def log_eval_stats(eval_data_source, eval_steps, last_n, sp, logger, device):
 class LMTrainer:
     """A language modelling trainer. """
     
-    def __init__(self, config, logger, model, opt, train_batches, eval_batches, scheduler=None):
+    def __init__(self, config, logger, model, opt, train_batches, eval_batches, vocab_mapping, scheduler=None):
         train_utils.check_config(config, DEFAULT_CONFIG)
         self.c = c = config
         self.logger = logger
@@ -214,6 +251,7 @@ class LMTrainer:
         self.train_batches = train_batches
         self.eval_batches = eval_batches
         self.scaler = torch.cuda.amp.GradScaler(enabled=c.device.type == "cuda")
+        self.vocab_mapping = vocab_mapping
 
         # log hyperparameters
         train_utils.log_hyperparams(config, self.logger)
@@ -228,7 +266,7 @@ class LMTrainer:
 
         # load tokeniser
         self.sp = train_utils.load_tokeniser(config=c)
-        assert self.c.vocab_size == self.sp.vocab_size(), f"config vocab size {c.vocab_size} doesn't match tokeniser vocab size {self.sp.vocab_size()}"
+        assert vocab_mapping.input_vocab_size == self.sp.vocab_size(), f"mapping input vocab size {vocab_mapping.input_vocab_size} doesn't match tokeniser vocab size {self.sp.vocab_size()}"
 
         # get number of eval steps and total eval bytes since that will be the same for every evaluation run
         parallel_utils.mprint("Measure evaluation data size ...")
@@ -237,6 +275,7 @@ class LMTrainer:
                                                sp=self.sp,
                                                logger=self.logger,
                                                device=self.c.device,
+                                               vocab_mapping=self.vocab_mapping,
                                                last_n=self.c.seq_len)
 
     def train(self):
@@ -270,7 +309,7 @@ class LMTrainer:
             avg_loss = torch.tensor(0.0, device=c.device)
 
             load_watch.start()
-            total_batch_x, total_batch_y, _ = next(self.train_batches)
+            total_batch_x, total_batch_y, _, total_x_is_noncanonical = next(self.train_batches)
             check(total_batch_x, (c.gradient_accumulation_steps, c.train_batch_size // c.gradient_accumulation_steps // c.n_workers, c.seq_len))
             load_watch.pause().count()
 
@@ -283,9 +322,10 @@ class LMTrainer:
                 # select the current micro batch
                 batch_x = total_batch_x[micro_step]
                 batch_y = total_batch_y[micro_step]
+                x_is_noncanonical = total_x_is_noncanonical[micro_step]
                 check(batch_x, (c.train_batch_size // c.gradient_accumulation_steps // c.n_workers, c.seq_len))
                 bsz, seqlen = batch_x.shape
-                
+
                 # run forward pass
                 with torch.cuda.amp.autocast(enabled=c.device.type == "cuda"):
                     # get initial state
@@ -300,10 +340,10 @@ class LMTrainer:
                     
                     # perform the model forward pass with or without activation logs
                     if do_activations_log:
-                        logits, curr_state = self.model(batch_x, curr_state, log=(self.logger, step))
+                        logits, curr_state = self.model(batch_x, curr_state, x_is_noncanonical=x_is_noncanonical, log=(self.logger, step))
                     else:
                         forward_watch.start()
-                        logits, curr_state = self.model(batch_x, curr_state, log=None)
+                        logits, curr_state = self.model(batch_x, curr_state, x_is_noncanonical=x_is_noncanonical, log=None)
                         forward_watch.pause().count()                    
                     check(logits, (bsz, c.seq_len, c.vocab_size))
 
@@ -449,10 +489,11 @@ class LMTrainer:
         """Run the model on the test data."""
         c = self.c
         eval_state = common_utils.traverse(curr_state, lambda x: x[:1] if x is not None else None)
-        eval_total_loss, eval_total_topk, eval_token_count, _ = evaluation(config=c,
+        eval_total_loss, eval_total_topk, eval_token_count, _, _ = evaluation(config=c,
                                                                            model=self.model,
                                                                            state=eval_state,
                                                                            data_source=self.eval_batches,
+                                                                           vocab_mapping=self.vocab_mapping,
                                                                            max_steps=c.max_eval_steps)
         # loss and ppl over number of tokens
         eval_avg_loss = eval_total_loss / eval_token_count

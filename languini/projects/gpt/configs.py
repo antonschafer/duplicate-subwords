@@ -28,7 +28,7 @@ config_names = [
 def add_exp_name(config):
     """Constructs the name of the log folder used to easily identify the experiment. """
     c = config
-    c.exp_name = ("GPT{}_{}_bsz{}{}_sl{}_coslr{}to{}_h{}_ff{}_nH{}_dH{}_nl{}_clip{}_decay{}k_workers{}{}_fp16_seed{}{}"
+    c.exp_name = ("GPT{}_{}_bsz{}{}_sl{}_coslr{}to{}_h{}_ff{}_nH{}_dH{}_nl{}_clip{}_decay{}k_workers{}_fracduplicated:{}_pduplicate:{}_deduptype:{}_embednoncanonical:{}{}_fp16_seed{}{}"
                   .format("_flash" if c.use_flash else "",
                           c.dataset.replace("_", ""),
                           c.train_batch_size,
@@ -44,6 +44,10 @@ def add_exp_name(config):
                           c.grad_clip_norm,
                           c.decay_steps // 1_000,
                           c.n_workers,
+                          c.frac_duplicated,
+                          c.p_duplicate,
+                          c.dedup_type,
+                          c.embed_noncanonical,
                           "" if c.compile == "None" else f"_{c.compile}Compile",
                           c.seed,
                           f"_{c.comment}" if c.comment else "",
@@ -59,8 +63,14 @@ def load_config(name=None):
         data_root = "data/books",
         relative_log_path = "logs",         # Relative path to the log folder within the project folder languini-kitchen/projects/gpt/logs/
         dataset = "books_16384",
-        vocab_size = 16384,
+        vocab_size = None,                  # to be set when initializing vocab mapping
         debug = False,                      # simply adds a "_debug" suffix so logs are easily distinguishable
+
+        # (de)dup config
+        frac_duplicated = 0.0,              # fraction of vocabulary to duplicate
+        p_duplicate=None,                   # probability of a token being duplicated 
+        dedup_type = "",                    # type of deduplication to apply to the vocabulary ("whitespace", "lower", "plural", "all") or ""/None for none
+        embed_noncanonical = False,         # whether to add an extra embedding indicating whether a token is "non-canonical"
 
         # optimiser
         seed = 0,

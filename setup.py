@@ -33,6 +33,13 @@ install_requires_core = [
     "jupyter",
     "deepspeed==0.10.3",
     "seaborn",
+    "anthropic",
+    "tiktoken",
+    "transformers",
+    "gensim",
+    "evaluate",
+    "scikit-learn",
+    "accelerate",
 ]
 
 setup(
