@@ -42,10 +42,11 @@ from languini.common_lib import parallel_utils
 from languini.common_lib import experiment_utils
 from languini.common_lib.parallel_utils import mprint
 from languini.common_lib.parallel_utils import LOCAL_RANK, WORLD_RANK, WORLD_SIZE
+from languini.de_duplication.mappings import configure_dedup_mapping
 
 from model import Model
 
-def run(config):
+def run(config, eval_dedup_type):
     c = config
     mprint(f"WORLD_SIZE: {WORLD_SIZE}")  # total number of devices
     mprint(f"WORLD_RANK: {WORLD_RANK}")  # unique id within all devices
@@ -64,6 +65,30 @@ def run(config):
 
     # load tokeniser
     sp = train_utils.load_tokeniser(config=c)
+
+    # set dedup mapping
+    train_vocab_mapping = configure_dedup_mapping(
+        sp=sp,
+        frac_duplicated=c.frac_duplicated,
+        p_duplicate=config.p_duplicate,
+        dedup_type=c.dedup_type,
+    )
+    if eval_dedup_type:
+        if c.dedup_type and not c.dedup_type.startswith(eval_dedup_type):
+            raise ValueError(f"Model trained with {c.dedup_type=}, cannot evaluate with {eval_dedup_type=}")
+        if c.frac_duplicated > 0:
+            raise NotImplementedError(f"Model trained with {c.frac_duplicated=} > 0, cannot evaluate with deduplication ({eval_dedup_type=})")
+    else:
+        if c.dedup_type:
+            raise ValueError(f"Model trained with {c.dedup_type=}, cannot evaluate without deduplication")
+    eval_vocab_mapping = configure_dedup_mapping(
+        sp=sp,
+        frac_duplicated=0,
+        p_duplicate=None,
+        dedup_type=eval_dedup_type,
+    )
+    mprint(f"Using  '{train_vocab_mapping}' (de)duplication mapping for input data (same as in training)")
+    mprint(f"Setting deduplication mapping to '{eval_vocab_mapping}' for evaluation.")
 
     # eval
     c.eval_batch_size = 1
@@ -91,6 +116,7 @@ def run(config):
         device=c.device,
         end_of_doc_token=END_OF_DOC_TOKEN,
         shift_n=c.last_n,
+        vocab_mapping=train_vocab_mapping,
     )
 
     mprint("Measure test data size ...")
@@ -99,7 +125,8 @@ def run(config):
                                                                         last_n=c.last_n,
                                                                         sp=sp,
                                                                         logger=None,
-                                                                        device=c.device)
+                                                                        device=c.device,
+                                                                        vocab_mapping=eval_vocab_mapping)
     mprint(f"number of bytes: {eval_bytes:,}")
     mprint(f"number of batches: {batch_count:,}")
     mprint(f"number of tokens: {token_count:,}")
@@ -110,13 +137,15 @@ def run(config):
     mprint(f"sequence length: {c.seq_len}")
     mprint(f"evalulate last_n tokens per batch: {c.last_n}")
 
-    eval_total_loss, eval_total_topk, eval_token_count, _ = lm_trainer.evaluation(config=c,
+    eval_total_loss, eval_total_topk, eval_token_count, _, full_eval_data = lm_trainer.evaluation(config=c,
                                                                                     model=model,
                                                                                     state=curr_state,
                                                                                     data_source=ds,
                                                                                     max_steps=batch_count,
                                                                                     last_n=c.last_n,
-                                                                                    print_progress=True)
+                                                                                    print_progress=True,
+                                                                                    vocab_mapping=eval_vocab_mapping,
+                                                                                    track_full_data=True)
     # loss and ppl over number of tokens
     eval_avg_loss = eval_total_loss / eval_token_count
     eval_ppl = math.exp(eval_avg_loss)
@@ -141,6 +170,19 @@ def run(config):
     
     mprint("Done!")
 
+    return {
+        "metrics": {
+            "num_tokens": int(eval_token_count),
+            "total_loss": float(eval_total_loss),
+            "avg_loss": float(eval_avg_loss),
+            "ppl": float(eval_ppl),
+            "normalised_loss": float(eval_norm_loss),
+            "normalised_ppl": float(eval_norm_ppl),
+            **{f"top-{k}": float(v) for k, v in eval_topk_accs.items()},
+        },
+        "full_eval_data": {k : v.cpu().numpy() for k, v in full_eval_data.items()},
+    }
+
 
 def main():
     """Load relevant args and evaluate on some data split."""
@@ -159,6 +201,7 @@ def main():
     parser.add_argument("--wandb_run", default="", type=str, help=f"Wandb run to load model config and checkpoint from.")
     parser.add_argument("--eval_data_split", default="test", type=str, help=f"Name of the languini books split to do eval on.")
     parser.add_argument("--last_n", default=-1, type=int, help=f"Last n tokens to evaluate in the sequence.")
+    parser.add_argument("--eval_dedup_type", default="", type=str, help=f"Deduplication to apply before computing eval metrics.")
     args = parser.parse_args(sys.argv[1:])
 
     # download file from wandb if necessary
@@ -180,7 +223,28 @@ def main():
     config.last_n = args.last_n if args.last_n > 0 else config.seq_len
     config.device = device
 
-    run(config)
+    results = run(config, eval_dedup_type=args.eval_dedup_type)
+
+    # name the results
+    results_identifier = f"{args.eval_data_split}_{args.last_n}"
+    if args.eval_dedup_type:
+        # specified dedup type overrides the one in the config (used during training)
+        results_identifier += f"_{args.eval_dedup_type}"
+
+    if args.wandb_run:
+        print("Uploading results to wandb ...")
+        # update the run's summary metrics
+        experiment_utils.log_wandb_summary_metrics(
+            args.wandb_run,
+            {f"{results_identifier}/{k}": v for k, v in results["metrics"].items()}
+        )
+        # upload the full eval data if available
+        experiment_utils.upload_arrays_to_wandb(
+            args.wandb_run,
+            {f"{results_identifier}/{k}": v for k, v in results["full_eval_data"].items()}
+        )
+
+    print("Done.")
 
 
 if __name__ == "__main__":

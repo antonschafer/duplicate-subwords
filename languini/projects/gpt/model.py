@@ -21,6 +21,7 @@ from munch import Munch
 from languini.train_lib.train_utils import check_config
 from languini.common_lib.debug_utils import check
 from languini.common_lib.debug_utils import log_stats_and_dist
+from languini.de_duplication.mappings import DEDUP_TRANSFORMS
 
 from lib import LayerNorm
 from lib import Block
@@ -66,17 +67,30 @@ class Model(torch.nn.Module):
         self.linear = nn.Linear(c.h_dim, c.vocab_size, bias=False)
         torch.nn.init.normal_(self.linear.weight, mean=0.0, std=0.02)
 
+        if c.embed_noncanonical:
+            dedup_types = DEDUP_TRANSFORMS.keys()
+            assert c.dedup_type in dedup_types
+            self.noncanon_embeddings = nn.ParameterDict()
+            for dt in [c.dedup_type] if c.dedup_type != "all" else [k for k in dedup_types if k != "all"]:
+                # initialize with zeros
+                self.noncanon_embeddings[dt] = nn.Parameter(torch.zeros(1, 1, c.h_dim))
+        else:
+            self.noncanon_embeddings = None
 
     def get_init_state(self, batch_size, device):
        return None
     
-    def forward(self, x, state, log=None):
+    def forward(self, x, state, x_is_noncanonical=None, log=None):
         # x: [batch_size, seq_length]
         bsz, seqlen = x.shape
         c = self.c
 
-        # embedd input tokens   
-        x = self.input_embedding(x) * math.sqrt(c.h_dim)
+        # embed input tokens   
+        x = self.input_embedding(x)
+        if self.noncanon_embeddings is not None:
+            for k, v in self.noncanon_embeddings.items():
+                x = torch.where(x_is_noncanonical[k].unsqueeze(-1), x + v, x)
+        x = x * math.sqrt(c.h_dim)
         check(x, (bsz, seqlen, c.h_dim))
 
         # add position embedding

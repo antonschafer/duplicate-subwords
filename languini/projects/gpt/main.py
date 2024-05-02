@@ -37,11 +37,12 @@ import sys
 import torch
 import torch.multiprocessing as mp
 
-from languini.train_lib import lm_trainer
+from languini.train_lib import lm_trainer, train_utils
 from languini.train_lib import lr_schedules
 from languini.common_lib import parallel_utils
 from languini.common_lib import experiment_utils
 from languini.dataset_lib import languini_books
+from languini.de_duplication.mappings import configure_dedup_mapping
 
 from languini.common_lib.parallel_utils import mprint
 from languini.common_lib.parallel_utils import LOCAL_RANK, WORLD_RANK, WORLD_SIZE
@@ -49,7 +50,7 @@ from languini.common_lib.parallel_utils import LOCAL_RANK, WORLD_RANK, WORLD_SIZ
 import configs
 from model import Model
 
-def run(config, logger):
+def run(config, logger, vocab_mapping):
     c = config
     
     mprint(f"{c.n_workers} workers detected. Using DistributedDataParallel. Local rank: {LOCAL_RANK}. Device: {c.device}")
@@ -82,6 +83,7 @@ def run(config, logger):
         sequence_length=c.seq_len,
         device=c.device,
         end_of_doc_token=END_OF_DOC_TOKEN,
+        vocab_mapping=vocab_mapping,
     )
     eval_ds = languini_books.LanguiniDatasetIterator(
         data_path=full_data_path,
@@ -93,6 +95,7 @@ def run(config, logger):
         sequence_length=c.seq_len,
         device=c.device,
         end_of_doc_token=END_OF_DOC_TOKEN,
+        vocab_mapping=vocab_mapping,
     )
 
     ## Setup Model
@@ -123,7 +126,8 @@ def run(config, logger):
                                    opt=opt,
                                    scheduler=scheduler,
                                    train_batches=train_ds,
-                                   eval_batches=eval_ds)
+                                   eval_batches=eval_ds,
+                                   vocab_mapping=vocab_mapping)
 
     mprint("Begin training ... ")
     trainer.train()
@@ -161,6 +165,17 @@ def main():
     # Check if the config matches the available hardware
     config = experiment_utils.check_hardware(config, world_size=WORLD_SIZE)
 
+    # Setup the vocabulary mapping
+    assert config.get("vocab_size") is None, "vocab size is set when configuring (de)duplication mapping"
+    vocab_mapping = configure_dedup_mapping(
+        sp=train_utils.load_tokeniser(config),
+        frac_duplicated=config.frac_duplicated,
+        p_duplicate=config.p_duplicate,
+        dedup_type=config.dedup_type,
+    )
+    config.vocab_size = vocab_mapping.output_vocab_size
+    print(f"Using (de)duplication mapping: {vocab_mapping}")
+
     # Generate experiment name based on config
     configs.add_exp_name(config)
     mprint(f"experiment name: {config.exp_name}")
@@ -168,7 +183,7 @@ def main():
     # Create the log folder, backup python files, and backup the hyperparameter config to a file
     logger = experiment_utils.setup_experiment(config)
     
-    run(config, logger)
+    run(config, logger, vocab_mapping)
 
 
 if __name__ == "__main__":
