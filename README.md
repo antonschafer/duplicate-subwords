@@ -5,7 +5,7 @@ Code to the paper [On the Effect of (Near) Duplicate Subwords in Language Modell
 ## Reproducing Plots
 To reproduce the plots from the paper without retraining models, you can load the relevant results via
 ```
-wget https://github.com/antonschafer/duplicate-subwords-data/raw/main/results.zip
+wget https://y5d6.c15.e2-3.dev/public-bucket/results.zip
 unzip results.zip
 ```
 then install languini in a new environment
